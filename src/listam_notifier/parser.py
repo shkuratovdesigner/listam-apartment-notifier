@@ -20,7 +20,8 @@ def parse_listings(html: str) -> list[Listing]:
     soup = BeautifulSoup(html, "html.parser")
     listings: list[Listing] = []
     seen: set[str] = set()
-    for card in soup.select('a[href^="/item/"]'):
+    # Match /item/<id> and locale-prefixed variants (/ru/item/<id> etc.).
+    for card in soup.select('a[href*="/item/"]'):
         href = card.get("href", "")
         item_id = href.split("/item/", 1)[-1].split("?")[0].strip("/")
         if not item_id.isdigit() or item_id in seen:
@@ -41,7 +42,9 @@ def parse_listings(html: str) -> list[Listing]:
         seen.add(item_id)
         listings.append(Listing(
             item_id=item_id,
-            url=f"{BASE_URL}/item/{item_id}",
+            # Built from the actual href so the link keeps the page's locale
+            # (e.g. /ru/item/...) instead of forcing the default language.
+            url=BASE_URL + href.split("?")[0],
             title=title_el.get_text(strip=True) if title_el else "",
             price=price_el.get_text(strip=True),
             location=loc_el.get_text(strip=True) if loc_el else "",
