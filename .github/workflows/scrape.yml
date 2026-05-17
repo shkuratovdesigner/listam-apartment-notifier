@@ -1,8 +1,11 @@
 name: ListAM scrape
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"   # every ~10 min (GitHub may delay this)
+  # The schedule is intentionally disabled until the first run has been done
+  # with Telegram secrets in place. Re-enable by uncommenting the two lines
+  # below once setup is complete (see docs/SETUP.md).
+  # schedule:
+  #   - cron: "*/10 * * * *"   # every ~10 min (GitHub may delay this)
   workflow_dispatch: {}
 
 concurrency:
