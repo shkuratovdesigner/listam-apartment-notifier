@@ -4,107 +4,26 @@
 
 **Goal:** A Python scraper, run on a GitHub Actions schedule, that detects new list.am apartment listings matching a saved filter and sends them to a Telegram bot.
 
-**Architecture:** One scraper module fetches and parses the filter URL with `requests` + `BeautifulSoup`. Seen item IDs are persisted in a `state.json` file committed back to the repo between runs (GitHub Actions runners are ephemeral). New listings trigger Telegram Bot API messages. Repeated failures trigger a Telegram alert.
+**Architecture:** A fetcher uses `curl_cffi` (browser TLS impersonation) to pass list.am's Cloudflare challenge. A parser extracts listing cards with `BeautifulSoup`. Seen item IDs persist in a `state.json` committed back to the repo between runs. Ongoing runs notify on never-seen IDs (cheap). The one-time first run additionally opens each item page to read its posted date and notifies for listings posted today. Repeated failures trigger a Telegram alert.
 
-**Tech Stack:** Python 3.11 · `requests` · `beautifulsoup4` · `pytest` · GitHub Actions · Telegram Bot API.
+**Tech Stack:** Python 3.11 (CI) / 3.9 (local) · `curl_cffi` · `beautifulsoup4` · `pytest` · GitHub Actions · Telegram Bot API.
 
 ---
+
+## Recon results (Task 2 — already done)
+
+- list.am is behind Cloudflare. `curl_cffi` with `impersonate="chrome"` passes it (HTTP 200). Plain `requests` gets 403.
+- Fixture saved: `tests/fixtures/listam_page1.html` (real results page, ~560 KB).
+- Listing card = `<a href="/item/<id>?...">` containing `div.p` (price), `div.l` (title), `div.at` (location), `<img>` (photo). **No date on the card.**
+- Item page footer contains `Տեղադրված է DD.MM.YYYY` = posted date.
+- `srt=3` sorts by renewal date, not post date.
 
 ## Conventions
 
-- Source in `src/listam_notifier/`, tests in `tests/`.
-- Run tests with `python -m pytest`.
-- TDD: parser, state, and message-formatting logic are tested against saved HTML fixtures and mocks. Network calls are not unit-tested.
+- Source in `src/listam_notifier/`, tests in `tests/`. Run tests with `python3 -m pytest`.
+- **Every module starts with `from __future__ import annotations`** so `X | None` type hints work on local Python 3.9.
+- TDD for parser, state, date-parsing, and message formatting (tested vs. fixtures/mocks). Network wrappers are smoke-tested manually, not unit-tested.
 - Commit after every task.
-
----
-
-### Task 1: Project scaffold
-
-**Files:**
-- Create: `requirements.txt`
-- Create: `.gitignore`
-- Create: `src/listam_notifier/__init__.py`
-- Create: `tests/__init__.py`
-- Create: `pytest.ini`
-
-**Step 1: Create `requirements.txt`**
-
-```
-requests==2.32.3
-beautifulsoup4==4.12.3
-pytest==8.3.3
-```
-
-**Step 2: Create `.gitignore`**
-
-```
-__pycache__/
-*.pyc
-.pytest_cache/
-.env
-venv/
-```
-
-**Step 3: Create empty `src/listam_notifier/__init__.py` and `tests/__init__.py`**
-
-**Step 4: Create `pytest.ini`**
-
-```ini
-[pytest]
-pythonpath = src
-testpaths = tests
-```
-
-**Step 5: Install and verify**
-
-Run: `python -m pip install -r requirements.txt && python -m pytest`
-Expected: pytest runs, "no tests ran".
-
-**Step 6: Commit**
-
-```bash
-git add -A
-git commit -m "chore: project scaffold"
-```
-
----
-
-### Task 2: Reconnaissance — capture a real list.am page
-
-Confirms the HTML structure before writing the parser. Not test-driven; it produces a fixture.
-
-**Files:**
-- Create: `tests/fixtures/listam_page1.html`
-
-**Step 1: Fetch the live filter page**
-
-Run:
-```bash
-curl -s -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" \
-  "https://www.list.am/category/56?n=2%2C3%2C5%2C6%2C7%2C9%2C10%2C13&price1=240000&price2=300000&srt=3&pg=1" \
-  -o tests/fixtures/listam_page1.html
-```
-
-**Step 2: Inspect the structure**
-
-Open the file. Identify and write down in the plan or a scratch note:
-- The container element for each listing card (likely `<a>` with `href="/item/<id>"`).
-- Where price, title/address, and photo URL live within a card.
-- Whether a post date ("today" / relative time) appears on the card.
-- The pagination control (next-page link).
-
-**Step 3: Decide the "posted today" strategy**
-
-- If the card shows a date → parse it from the card.
-- If not → the first run sends the top listings as "today's batch" and treats only later-unseen IDs as new (item-page fetch avoided to keep request volume low). Record the chosen approach in `docs/plans/2026-05-18-listam-telegram-notifier-design.md`.
-
-**Step 4: Commit**
-
-```bash
-git add tests/fixtures/listam_page1.html docs/plans/
-git commit -m "chore: capture list.am page fixture"
-```
 
 ---
 
@@ -116,8 +35,6 @@ git commit -m "chore: capture list.am page fixture"
 
 **Step 1: Write the failing test**
 
-Adjust selectors/expected values to the real fixture from Task 2.
-
 ```python
 from pathlib import Path
 from listam_notifier.parser import parse_listings
@@ -125,36 +42,33 @@ from listam_notifier.parser import parse_listings
 FIXTURE = Path(__file__).parent / "fixtures" / "listam_page1.html"
 
 def test_parse_listings_extracts_items():
-    html = FIXTURE.read_text(encoding="utf-8")
-    listings = parse_listings(html)
-    assert len(listings) > 0
+    listings = parse_listings(FIXTURE.read_text(encoding="utf-8"))
+    assert len(listings) > 20  # the fixture page has ~100 cards
     first = listings[0]
     assert first.item_id.isdigit()
-    assert first.url.startswith("https://www.list.am/item/")
-    assert first.price  # non-empty
-    assert first.title  # non-empty
+    assert first.url == f"https://www.list.am/item/{first.item_id}"
+    assert first.price
+    assert first.title
 
 def test_parse_listings_ids_are_unique():
-    html = FIXTURE.read_text(encoding="utf-8")
-    listings = parse_listings(html)
+    listings = parse_listings(FIXTURE.read_text(encoding="utf-8"))
     ids = [l.item_id for l in listings]
     assert len(ids) == len(set(ids))
 ```
 
-**Step 2: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_parser.py -v`
-Expected: FAIL — `parser` module not found.
+**Step 2: Run test — expect FAIL** (`parser` not found).
+Run: `python3 -m pytest tests/test_parser.py -v`
 
 **Step 3: Implement `parser.py`**
 
-Implement using selectors confirmed in Task 2. Skeleton:
-
 ```python
+from __future__ import annotations
+
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.list.am"
+
 
 @dataclass
 class Listing:
@@ -164,33 +78,39 @@ class Listing:
     price: str
     location: str
     photo_url: str | None
-    posted_today: bool
+
 
 def parse_listings(html: str) -> list[Listing]:
     soup = BeautifulSoup(html, "html.parser")
-    listings = []
-    # Selectors below MUST match the Task 2 fixture.
+    listings: list[Listing] = []
+    seen: set[str] = set()
     for card in soup.select('a[href^="/item/"]'):
         href = card.get("href", "")
-        item_id = href.rsplit("/", 1)[-1].split("?")[0]
-        if not item_id.isdigit():
+        item_id = href.split("/item/", 1)[-1].split("?")[0].strip("/")
+        if not item_id.isdigit() or item_id in seen:
             continue
-        # Extract price / title / location / photo / date per Task 2 findings.
-        ...
-        listings.append(Listing(...))
-    # De-duplicate by item_id, preserving order.
-    seen, unique = set(), []
-    for l in listings:
-        if l.item_id not in seen:
-            seen.add(l.item_id)
-            unique.append(l)
-    return unique
+        price_el = card.select_one("div.p")
+        if price_el is None:
+            continue  # not a real listing card
+        title_el = card.select_one("div.l")
+        loc_el = card.select_one("div.at")
+        img_el = card.select_one("img")
+        photo = img_el.get("src") if img_el else None
+        if photo and photo.startswith("//"):
+            photo = "https:" + photo
+        seen.add(item_id)
+        listings.append(Listing(
+            item_id=item_id,
+            url=f"{BASE_URL}/item/{item_id}",
+            title=title_el.get_text(strip=True) if title_el else "",
+            price=price_el.get_text(strip=True),
+            location=loc_el.get_text(strip=True) if loc_el else "",
+            photo_url=photo,
+        ))
+    return listings
 ```
 
-**Step 4: Run test to verify it passes**
-
-Run: `python -m pytest tests/test_parser.py -v`
-Expected: PASS.
+**Step 4: Run test — expect PASS.**
 
 **Step 5: Commit**
 
@@ -201,7 +121,75 @@ git commit -m "feat: parse list.am listing cards"
 
 ---
 
-### Task 4: State persistence
+### Task 4: Item-page posted-date parser
+
+**Files:**
+- Create: `src/listam_notifier/item_date.py`
+- Test: `tests/test_item_date.py`
+- Test fixture: capture one item page (see Step 1).
+
+**Step 1: Capture an item-page fixture**
+
+Run:
+```bash
+python3 -c "from curl_cffi import requests as cr; open('tests/fixtures/listam_item.html','w',encoding='utf-8').write(cr.get('https://www.list.am/item/23198485',impersonate='chrome',timeout=30).text)"
+```
+(If item 23198485 is gone, pick any current item ID from the results page.)
+
+**Step 2: Write the failing test**
+
+```python
+from datetime import date
+from pathlib import Path
+from listam_notifier.item_date import parse_posted_date
+
+FIXTURE = Path(__file__).parent / "fixtures" / "listam_item.html"
+
+def test_parse_posted_date_returns_date():
+    result = parse_posted_date(FIXTURE.read_text(encoding="utf-8"))
+    assert isinstance(result, date)
+
+def test_parse_posted_date_missing_returns_none():
+    assert parse_posted_date("<html><body>no date here</body></html>") is None
+```
+
+**Step 3: Run test — expect FAIL.**
+
+**Step 4: Implement `item_date.py`**
+
+```python
+from __future__ import annotations
+
+import re
+from datetime import date
+
+# Footer text looks like: "Տեղադրված է 06.12.2025"
+_POSTED_RE = re.compile(r"Տեղադրված\s*է\s*(\d{2})\.(\d{2})\.(\d{4})")
+
+
+def parse_posted_date(item_html: str) -> date | None:
+    match = _POSTED_RE.search(item_html)
+    if not match:
+        return None
+    day, month, year = (int(g) for g in match.groups())
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+```
+
+**Step 5: Run test — expect PASS.**
+
+**Step 6: Commit**
+
+```bash
+git add src/listam_notifier/item_date.py tests/test_item_date.py tests/fixtures/listam_item.html
+git commit -m "feat: parse posted date from item page"
+```
+
+---
+
+### Task 5: State persistence
 
 **Files:**
 - Create: `src/listam_notifier/state.py`
@@ -227,17 +215,17 @@ def test_save_then_load_roundtrip(tmp_path):
     assert state.initialized is True
 ```
 
-**Step 2: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_state.py -v`
-Expected: FAIL — `state` module not found.
+**Step 2: Run test — expect FAIL.**
 
 **Step 3: Implement `state.py`**
 
 ```python
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
 
 @dataclass
 class State:
@@ -245,15 +233,18 @@ class State:
     consecutive_failures: int = 0
     initialized: bool = False
 
+
 def load_state(path: Path) -> State:
-    if not Path(path).exists():
+    path = Path(path)
+    if not path.exists():
         return State()
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
     return State(
         seen_ids=set(data.get("seen_ids", [])),
         consecutive_failures=data.get("consecutive_failures", 0),
         initialized=data.get("initialized", False),
     )
+
 
 def save_state(path: Path, state: State) -> None:
     payload = {
@@ -264,10 +255,7 @@ def save_state(path: Path, state: State) -> None:
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 ```
 
-**Step 4: Run test to verify it passes**
-
-Run: `python -m pytest tests/test_state.py -v`
-Expected: PASS.
+**Step 4: Run test — expect PASS.**
 
 **Step 5: Commit**
 
@@ -278,79 +266,77 @@ git commit -m "feat: add state persistence"
 
 ---
 
-### Task 5: Telegram message formatting
-
-Formatting is tested; the actual HTTP send is a thin wrapper, not unit-tested.
+### Task 6: Telegram messaging
 
 **Files:**
 - Create: `src/listam_notifier/telegram.py`
 - Test: `tests/test_telegram.py`
 
-**Step 1: Write the failing test**
+**Step 1: Write the failing test** (only the pure formatter is unit-tested)
 
 ```python
 from listam_notifier.parser import Listing
 from listam_notifier.telegram import format_listing_message
 
 def test_format_listing_message_contains_key_fields():
-    listing = Listing(
-        item_id="123", url="https://www.list.am/item/123",
-        title="2-room apartment", price="$250,000",
-        location="Yerevan, Center", photo_url=None, posted_today=True,
-    )
+    listing = Listing("123", "https://www.list.am/item/123",
+                       "2 senyak apartment", "280,000 dram", "Ajapnyak", None)
     msg = format_listing_message(listing)
-    assert "2-room apartment" in msg
-    assert "$250,000" in msg
-    assert "Yerevan, Center" in msg
+    assert "2 senyak apartment" in msg
+    assert "280,000 dram" in msg
+    assert "Ajapnyak" in msg
     assert "https://www.list.am/item/123" in msg
 ```
 
-**Step 2: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_telegram.py -v`
-Expected: FAIL — `telegram` module not found.
+**Step 2: Run test — expect FAIL.**
 
 **Step 3: Implement `telegram.py`**
 
 ```python
-import requests
+from __future__ import annotations
+
+import html
+
+from curl_cffi import requests as cr
+
 from listam_notifier.parser import Listing
 
-API = "https://api.telegram.org/bot{token}/{method}"
+_API = "https://api.telegram.org/bot{token}/{method}"
+
 
 def format_listing_message(listing: Listing) -> str:
     return (
-        f"🏠 <b>{listing.title}</b>\n"
-        f"💰 {listing.price}\n"
-        f"📍 {listing.location}\n"
+        f"\U0001F3E0 <b>{html.escape(listing.title)}</b>\n"
+        f"\U0001F4B0 {html.escape(listing.price)}\n"
+        f"\U0001F4CD {html.escape(listing.location)}\n"
         f"{listing.url}"
     )
 
+
 def send_message(token: str, chat_id: str, text: str, photo_url: str | None = None) -> None:
     if photo_url:
-        resp = requests.post(
-            API.format(token=token, method="sendPhoto"),
-            data={"chat_id": chat_id, "photo": photo_url, "caption": text, "parse_mode": "HTML"},
+        resp = cr.post(
+            _API.format(token=token, method="sendPhoto"),
+            data={"chat_id": chat_id, "photo": photo_url,
+                  "caption": text, "parse_mode": "HTML"},
             timeout=20,
         )
         if resp.status_code == 200:
             return
-        # Fall back to a plain text message if the photo is rejected.
-    requests.post(
-        API.format(token=token, method="sendMessage"),
-        data={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": False},
+        # photo rejected (e.g. webp not fetchable) -> fall through to text
+    resp = cr.post(
+        _API.format(token=token, method="sendMessage"),
+        data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
         timeout=20,
-    ).raise_for_status()
+    )
+    resp.raise_for_status()
+
 
 def send_alert(token: str, chat_id: str, text: str) -> None:
-    send_message(token, chat_id, f"⚠️ ListAM scraper: {text}")
+    send_message(token, chat_id, f"⚠️ ListAM scraper: {html.escape(text)}")
 ```
 
-**Step 4: Run test to verify it passes**
-
-Run: `python -m pytest tests/test_telegram.py -v`
-Expected: PASS.
+**Step 4: Run test — expect PASS.**
 
 **Step 5: Commit**
 
@@ -361,61 +347,77 @@ git commit -m "feat: add telegram messaging"
 
 ---
 
-### Task 6: Fetcher
+### Task 7: Fetcher
 
 **Files:**
+- Modify: `requirements.txt` (add `curl_cffi`)
 - Create: `src/listam_notifier/fetcher.py`
 
-Thin network wrapper — no unit test (covered manually + by the main run).
+No unit test (network wrapper) — smoke-tested in Step 3.
 
-**Step 1: Implement `fetcher.py`**
+**Step 1: Add `curl_cffi` to `requirements.txt`**
+
+Append a line: `curl_cffi==0.7.4` (or the version installed; check with `python3 -m pip show curl_cffi`).
+
+**Step 2: Implement `fetcher.py`**
 
 ```python
+from __future__ import annotations
+
+import re
 import time
-import requests
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,hy;q=0.7",
-}
+from curl_cffi import requests as cr
 
-def fetch_page(filter_url: str, page: int) -> str:
-    """Fetch one results page. filter_url must already contain query params."""
-    url = filter_url
-    if "pg=" in url:
-        import re
-        url = re.sub(r"pg=\d+", f"pg={page}", url)
-    else:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}pg={page}"
-    last_exc = None
+_IMPERSONATE = "chrome"
+
+
+def _get(url: str) -> str:
+    last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=25)
+            resp = cr.get(url, impersonate=_IMPERSONATE, timeout=30)
             resp.raise_for_status()
+            if "Just a moment" in resp.text[:1000]:
+                raise RuntimeError("Cloudflare challenge not passed")
             return resp.text
-        except requests.RequestException as exc:
+        except Exception as exc:  # noqa: BLE001
             last_exc = exc
             time.sleep(2 * (attempt + 1))
-    raise last_exc
+    raise last_exc  # type: ignore[misc]
+
+
+def fetch_results_page(filter_url: str, page: int) -> str:
+    if "pg=" in filter_url:
+        url = re.sub(r"pg=\d+", f"pg={page}", filter_url)
+    else:
+        sep = "&" if "?" in filter_url else "?"
+        url = f"{filter_url}{sep}pg={page}"
+    return _get(url)
+
+
+def fetch_item_page(item_id: str) -> str:
+    return _get(f"https://www.list.am/item/{item_id}")
 ```
 
-**Step 2: Smoke-test manually**
+**Step 3: Smoke-test**
 
-Run: `python -c "from listam_notifier.fetcher import fetch_page; print(len(fetch_page('https://www.list.am/category/56?srt=3&pg=1', 1)))"`
-Expected: prints a positive number (page length).
+Run:
+```bash
+python3 -c "from listam_notifier.fetcher import fetch_results_page; t=fetch_results_page('https://www.list.am/category/56?srt=3&pg=1',1); print(len(t), '/item/' in t)"
+```
+Expected: a large number and `True`.
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add src/listam_notifier/fetcher.py
-git commit -m "feat: add page fetcher"
+git add requirements.txt src/listam_notifier/fetcher.py
+git commit -m "feat: add curl_cffi-based fetcher"
 ```
 
 ---
 
-### Task 7: Main orchestration
+### Task 8: Main orchestration
 
 **Files:**
 - Create: `src/listam_notifier/config.py`
@@ -425,6 +427,8 @@ git commit -m "feat: add page fetcher"
 **Step 1: Create `config.py`**
 
 ```python
+from __future__ import annotations
+
 import os
 
 FILTER_URL = os.environ.get(
@@ -437,74 +441,85 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 MAX_PAGES = int(os.environ.get("LISTAM_MAX_PAGES", "5"))
 FAILURE_ALERT_THRESHOLD = 3
+ITEM_FETCH_DELAY_SEC = 1.0  # politeness delay during the first-run date sweep
 ```
 
-**Step 2: Write the failing test for the core decision logic**
-
-The notify-decision is pure and testable. Put it in `main.py` as `select_new_listings`.
+**Step 2: Write the failing test** for the pure decision helper `select_ongoing_new`:
 
 ```python
 from listam_notifier.parser import Listing
 from listam_notifier.state import State
-from listam_notifier.main import select_new_listings
+from listam_notifier.main import select_ongoing_new
 
-def _listing(i, today=True):
+def _l(i):
     return Listing(str(i), f"https://www.list.am/item/{i}", f"Apt {i}",
-                   "$250,000", "Yerevan", None, today)
+                   "280,000", "Yerevan", None)
 
-def test_first_run_selects_only_today():
-    listings = [_listing(1, today=True), _listing(2, today=False)]
-    state = State(initialized=False)
-    new = select_new_listings(listings, state)
-    assert [l.item_id for l in new] == ["1"]
-
-def test_later_run_selects_unseen_ids():
-    listings = [_listing(1), _listing(2), _listing(3)]
+def test_select_ongoing_new_returns_unseen_ids():
+    listings = [_l(1), _l(2), _l(3)]
     state = State(seen_ids={"1", "2"}, initialized=True)
-    new = select_new_listings(listings, state)
-    assert [l.item_id for l in new] == ["3"]
+    assert [l.item_id for l in select_ongoing_new(listings, state)] == ["3"]
+
+def test_select_ongoing_new_empty_when_all_seen():
+    listings = [_l(1), _l(2)]
+    state = State(seen_ids={"1", "2"}, initialized=True)
+    assert select_ongoing_new(listings, state) == []
 ```
 
-**Step 3: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_main.py -v`
-Expected: FAIL — `select_new_listings` not found.
+**Step 3: Run test — expect FAIL.**
 
 **Step 4: Implement `main.py`**
 
 ```python
+from __future__ import annotations
+
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from listam_notifier import config
-from listam_notifier.fetcher import fetch_page
+from listam_notifier.fetcher import fetch_results_page, fetch_item_page
+from listam_notifier.item_date import parse_posted_date
 from listam_notifier.parser import Listing, parse_listings
 from listam_notifier.state import State, load_state, save_state
 from listam_notifier.telegram import format_listing_message, send_message, send_alert
 
+ARMENIA_TZ = timezone(timedelta(hours=4))
 
-def select_new_listings(listings: list[Listing], state: State) -> list[Listing]:
-    if not state.initialized:
-        return [l for l in listings if l.posted_today]
+
+def select_ongoing_new(listings: list[Listing], state: State) -> list[Listing]:
     return [l for l in listings if l.item_id not in state.seen_ids]
 
 
 def collect_listings() -> list[Listing]:
-    """Fetch pages until one yields no new IDs or MAX_PAGES is reached."""
+    """Fetch results pages until one yields no new IDs or MAX_PAGES is hit."""
     all_listings: list[Listing] = []
     seen: set[str] = set()
     for page in range(1, config.MAX_PAGES + 1):
-        html = fetch_page(config.FILTER_URL, page)
-        page_listings = parse_listings(html)
+        page_listings = parse_listings(fetch_results_page(config.FILTER_URL, page))
         fresh = [l for l in page_listings if l.item_id not in seen]
         if not fresh:
             break
-        for l in fresh:
-            seen.add(l.item_id)
+        seen.update(l.item_id for l in fresh)
         all_listings.extend(fresh)
-        if len(page_listings) < 1:
-            break
     return all_listings
+
+
+def select_first_run_today(listings: list[Listing]) -> list[Listing]:
+    """One-time: open each item page, keep those posted today (Armenia time)."""
+    today = datetime.now(ARMENIA_TZ).date()
+    todays: list[Listing] = []
+    for listing in listings:
+        try:
+            posted = parse_posted_date(fetch_item_page(listing.item_id))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  item {listing.item_id}: date fetch failed: {exc}", file=sys.stderr)
+            posted = None
+        if posted == today:
+            todays.append(listing)
+        time.sleep(config.ITEM_FETCH_DELAY_SEC)
+    return todays
 
 
 def run() -> int:
@@ -522,10 +537,14 @@ def run() -> int:
                        f"failed {state.consecutive_failures} times. Last error: {exc}")
         return 1
 
-    new_listings = select_new_listings(listings, state)
-    print(f"Found {len(listings)} listings, {len(new_listings)} new.")
+    if state.initialized:
+        to_send = select_ongoing_new(listings, state)
+    else:
+        print(f"First run: checking posted dates for {len(listings)} listings...")
+        to_send = select_first_run_today(listings)
 
-    for listing in new_listings:
+    print(f"Found {len(listings)} listings, sending {len(to_send)}.")
+    for listing in to_send:
         send_message(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID,
                      format_listing_message(listing), listing.photo_url)
 
@@ -540,10 +559,8 @@ if __name__ == "__main__":
     sys.exit(run())
 ```
 
-**Step 5: Run tests to verify they pass**
-
-Run: `python -m pytest -v`
-Expected: all tests PASS.
+**Step 5: Run all tests — expect PASS.**
+Run: `python3 -m pytest -v`
 
 **Step 6: Commit**
 
@@ -554,48 +571,21 @@ git commit -m "feat: add main orchestration"
 
 ---
 
-### Task 8: End-to-end local dry run
-
-**Step 1: Set credentials and run once locally**
-
-Run:
-```bash
-export TELEGRAM_TOKEN="<token from Task 9>"
-export TELEGRAM_CHAT_ID="<chat id from Task 9>"
-python -m listam_notifier.main
-```
-Expected: prints listing counts; first run delivers today's apartments to Telegram; `state.json` is created.
-
-**Step 2: Run a second time**
-
-Run: `python -m listam_notifier.main`
-Expected: "0 new" (unless something was just posted); no duplicate messages.
-
-**Step 3: Commit the baseline state**
-
-```bash
-git add state.json
-git commit -m "chore: add initial scraper state"
-```
-
----
-
 ### Task 9: Telegram bot setup (manual, documented)
 
 **Files:**
 - Create: `docs/SETUP.md`
 
-**Step 1: Write `docs/SETUP.md`** with these instructions:
+**Step 1: Write `docs/SETUP.md`** containing:
 
-1. In Telegram, open **@BotFather** → `/newbot` → choose a name and username → copy the **bot token**.
-2. Send any message to your new bot (so it can message you back).
-3. Get your chat ID: open
-   `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser → find
-   `"chat":{"id":...}` → copy that number.
+1. In Telegram, open **@BotFather** → `/newbot` → pick a name + username → copy the **bot token**.
+2. Send any message to the new bot so it is allowed to message you back.
+3. Get your chat ID: open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser, find `"chat":{"id":...}`, copy that number.
 4. In the GitHub repo: **Settings → Secrets and variables → Actions → New repository secret**:
-   - `TELEGRAM_TOKEN` = the bot token
-   - `TELEGRAM_CHAT_ID` = the chat ID
-5. (Optional) add `LISTAM_FILTER_URL` as a secret/variable to change the filter without editing code.
+   - `TELEGRAM_TOKEN` = bot token
+   - `TELEGRAM_CHAT_ID` = chat ID
+5. (Optional) add `LISTAM_FILTER_URL` to change the filter without editing code.
+6. To run locally: `export TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...` then `python3 -m listam_notifier.main`.
 
 **Step 2: Commit**
 
@@ -606,7 +596,24 @@ git commit -m "docs: telegram bot setup instructions"
 
 ---
 
-### Task 10: GitHub Actions workflow
+### Task 10: End-to-end local dry run
+
+Requires real Telegram credentials from Task 9 — run with the user.
+
+**Step 1:** `export TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...` then `python3 -m listam_notifier.main`.
+Expected: first run reports listing count, sends today's posts to Telegram, creates `state.json`.
+
+**Step 2:** Run again. Expected: "sending 0" (unless something new posted); no duplicates.
+
+**Step 3:** Commit the baseline state.
+```bash
+git add state.json
+git commit -m "chore: add initial scraper state"
+```
+
+---
+
+### Task 11: GitHub Actions workflow
 
 **Files:**
 - Create: `.github/workflows/scrape.yml`
@@ -618,7 +625,7 @@ name: ListAM scrape
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 min (GitHub may delay this)
+    - cron: "*/10 * * * *"   # every ~10 min (GitHub may delay this)
   workflow_dispatch: {}
 
 concurrency:
@@ -633,20 +640,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - run: pip install -r requirements.txt
-
       - name: Run scraper
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LISTAM_FILTER_URL: ${{ secrets.LISTAM_FILTER_URL }}
         run: python -m listam_notifier.main
-
       - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
@@ -665,17 +668,14 @@ git add .github/workflows/scrape.yml
 git commit -m "ci: add scheduled scrape workflow"
 ```
 
-**Step 3: Push to GitHub and verify**
-
-- Create a GitHub repo, add the secrets from Task 9, push.
-- Run the workflow manually via **Actions → ListAM scrape → Run workflow**.
-- Confirm a Telegram message arrives and `state.json` is updated by the bot commit.
+**Step 3: Push to GitHub, add the Task 9 secrets, run the workflow manually via Actions → Run workflow. Confirm a Telegram message arrives and the bot commits `state.json`.**
 
 ---
 
 ## Done criteria
 
-- `python -m pytest` passes.
-- A manual workflow run delivers new listings to Telegram and commits `state.json`.
-- Scheduled runs send only genuinely new listings, no duplicates.
-- A simulated failure (e.g. bad filter URL) eventually produces a Telegram alert.
+- `python3 -m pytest` passes.
+- A manual run delivers today's listings to Telegram and writes `state.json`.
+- A second run sends nothing (no duplicates).
+- A simulated failure (bad filter URL) eventually produces a Telegram alert.
+- The GitHub Actions workflow runs green and commits state back.
