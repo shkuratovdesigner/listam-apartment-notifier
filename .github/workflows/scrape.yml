@@ -1,0 +1,44 @@
+name: ListAM scrape
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every ~10 min (GitHub may delay this)
+  workflow_dispatch: {}
+
+concurrency:
+  group: listam-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LISTAM_FILTER_URL: ${{ secrets.LISTAM_FILTER_URL }}
+        run: python -m listam_notifier.main
+
+      - name: Commit updated state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update scraper state [skip ci]"
+            git pull --rebase --autostash
+            git push
+          fi
