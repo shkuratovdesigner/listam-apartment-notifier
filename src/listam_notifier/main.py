@@ -55,7 +55,8 @@ def select_first_run_today(listings: list[Listing]) -> tuple[list[Listing], set[
     today = datetime.now(ARMENIA_TZ).date()
     todays: list[Listing] = []
     undated_ids: set[str] = set()
-    for listing in listings:
+    total = len(listings)
+    for idx, listing in enumerate(listings, 1):
         try:
             posted = parse_posted_date(fetch_item_page(listing.item_id))
         except Exception as exc:  # noqa: BLE001
@@ -65,6 +66,9 @@ def select_first_run_today(listings: list[Listing]) -> tuple[list[Listing], set[
             todays.append(listing)
         elif posted is None:
             undated_ids.add(listing.item_id)
+        if idx % 25 == 0:
+            print(f"  ...{idx}/{total} dates checked, {len(todays)} from today",
+                  flush=True)
         time.sleep(config.ITEM_FETCH_DELAY_SEC)
     return todays, undated_ids
 
@@ -105,8 +109,10 @@ def run() -> int:
 
     undated_ids: set[str] = set()
     if first_run:
-        print(f"First run: checking posted dates for {len(listings)} listings...")
-        to_send, undated_ids = select_first_run_today(listings)
+        to_check = listings[:config.FIRST_RUN_DATE_CHECK_LIMIT]
+        print(f"First run: {len(listings)} listings baselined; checking posted "
+              f"dates for the {len(to_check)} most recent...")
+        to_send, undated_ids = select_first_run_today(to_check)
     else:
         to_send = select_ongoing_new(listings, state)
 
