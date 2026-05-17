@@ -15,3 +15,11 @@ def test_save_then_load_roundtrip(tmp_path):
     assert state.seen_ids == {"111", "222"}
     assert state.consecutive_failures == 2
     assert state.initialized is True
+
+
+def test_load_state_corrupt_file_returns_empty(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("{ this is not valid json", encoding="utf-8")
+    state = load_state(path)
+    assert state.seen_ids == set()
+    assert state.initialized is False

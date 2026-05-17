@@ -39,5 +39,6 @@ jobs:
           git add state.json
           if ! git diff --cached --quiet; then
             git commit -m "chore: update scraper state [skip ci]"
+            git pull --rebase --autostash
             git push
           fi

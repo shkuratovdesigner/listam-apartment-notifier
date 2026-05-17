@@ -25,5 +25,5 @@ def test_parse_listings_photo_is_real_or_none():
     for l in listings:
         assert l.photo_url is None or "heart" not in l.photo_url
     with_photo = [l for l in listings if l.photo_url]
-    assert with_photo, "expected at least some listings to have photos"
+    assert len(with_photo) > 50, "expected most listings to have photos"
     assert all(p.photo_url.startswith("https://s.list.am") for p in with_photo)

@@ -13,6 +13,7 @@ from listam_notifier.state import State, load_state, save_state
 from listam_notifier.telegram import format_listing_message, send_message, send_alert
 
 ARMENIA_TZ = timezone(timedelta(hours=4))
+SEND_DELAY_SEC = 1.0
 
 
 def select_ongoing_new(listings: list[Listing], state: State) -> list[Listing]:
@@ -20,11 +21,23 @@ def select_ongoing_new(listings: list[Listing], state: State) -> list[Listing]:
 
 
 def collect_listings() -> list[Listing]:
-    """Fetch results pages until one yields no new IDs or MAX_PAGES is hit."""
+    """Fetch results pages until one yields no new IDs or MAX_PAGES is hit.
+
+    A failure on the first page raises; a failure on a later page stops
+    pagination and returns whatever was collected so far.
+    """
     all_listings: list[Listing] = []
     seen: set[str] = set()
     for page in range(1, config.MAX_PAGES + 1):
-        page_listings = parse_listings(fetch_results_page(config.FILTER_URL, page))
+        try:
+            html = fetch_results_page(config.FILTER_URL, page)
+        except Exception as exc:  # noqa: BLE001
+            if not all_listings:
+                raise
+            print(f"page {page} fetch failed; continuing with "
+                  f"{len(all_listings)} listings: {exc}", file=sys.stderr)
+            break
+        page_listings = parse_listings(html)
         fresh = [l for l in page_listings if l.item_id not in seen]
         if not fresh:
             break
@@ -33,10 +46,15 @@ def collect_listings() -> list[Listing]:
     return all_listings
 
 
-def select_first_run_today(listings: list[Listing]) -> list[Listing]:
-    """One-time: open each item page, keep those posted today (Armenia time)."""
+def select_first_run_today(listings: list[Listing]) -> tuple[list[Listing], set[str]]:
+    """One-time: open each item page, keep those posted today (Armenia time).
+
+    Returns (todays, undated_ids). undated_ids are listings whose posted date
+    could not be fetched; callers leave them unseen so a later run retries.
+    """
     today = datetime.now(ARMENIA_TZ).date()
     todays: list[Listing] = []
+    undated_ids: set[str] = set()
     for listing in listings:
         try:
             posted = parse_posted_date(fetch_item_page(listing.item_id))
@@ -45,8 +63,24 @@ def select_first_run_today(listings: list[Listing]) -> list[Listing]:
             posted = None
         if posted == today:
             todays.append(listing)
+        elif posted is None:
+            undated_ids.add(listing.item_id)
         time.sleep(config.ITEM_FETCH_DELAY_SEC)
-    return todays
+    return todays, undated_ids
+
+
+def _send_all(to_send: list[Listing]) -> set[str]:
+    """Send each listing; return the set of item IDs that failed to send."""
+    failed: set[str] = set()
+    for listing in to_send:
+        try:
+            send_message(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID,
+                         format_listing_message(listing), listing.photo_url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  send failed for item {listing.item_id}: {exc}", file=sys.stderr)
+            failed.add(listing.item_id)
+        time.sleep(SEND_DELAY_SEC)
+    return failed
 
 
 def run() -> int:
@@ -60,22 +94,30 @@ def run() -> int:
         save_state(state_path, state)
         print(f"FETCH FAILED ({state.consecutive_failures}): {exc}", file=sys.stderr)
         if state.consecutive_failures >= config.FAILURE_ALERT_THRESHOLD:
-            send_alert(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID,
-                       f"failed {state.consecutive_failures} times. Last error: {exc}")
+            try:
+                send_alert(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID,
+                           f"failed {state.consecutive_failures} times. Last error: {exc}")
+            except Exception as alert_exc:  # noqa: BLE001
+                print(f"alert send failed: {alert_exc}", file=sys.stderr)
         return 1
 
+    undated_ids: set[str] = set()
     if state.initialized:
         to_send = select_ongoing_new(listings, state)
     else:
         print(f"First run: checking posted dates for {len(listings)} listings...")
-        to_send = select_first_run_today(listings)
+        to_send, undated_ids = select_first_run_today(listings)
 
     print(f"Found {len(listings)} listings, sending {len(to_send)}.")
-    for listing in to_send:
-        send_message(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID,
-                     format_listing_message(listing), listing.photo_url)
+    failed_ids = _send_all(to_send)
+    if failed_ids:
+        print(f"{len(failed_ids)} message(s) failed to send; "
+              f"will retry next run.", file=sys.stderr)
 
-    state.seen_ids.update(l.item_id for l in listings)
+    # Mark every listing seen EXCEPT ones we failed to send and ones whose
+    # first-run date lookup failed — those are retried on the next run.
+    skip = failed_ids | undated_ids
+    state.seen_ids.update(l.item_id for l in listings if l.item_id not in skip)
     state.initialized = True
     state.consecutive_failures = 0
     save_state(state_path, state)
