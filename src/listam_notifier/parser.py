@@ -30,10 +30,12 @@ def parse_listings(html: str) -> list[Listing]:
             continue
         title_el = card.select_one("div.l")
         loc_el = card.select_one("div.at")
-        img_el = card.select_one("img")
+        img_el = card.select_one('img[src*="s.list.am"]') or card.find("img", recursive=False)
         photo = img_el.get("src") if img_el else None
         if photo and photo.startswith("//"):
             photo = "https:" + photo
+        if photo and "s.list.am" not in photo:
+            photo = None
         seen.add(item_id)
         listings.append(Listing(
             item_id=item_id,
