@@ -39,12 +39,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # posting a listing renews it, so anything new surfaces at the top.
 MAX_PAGES = int(os.environ.get("LISTAM_MAX_PAGES") or "2")
 # The first run paginates to the end of the result set (this is a safety cap)
-# so every existing listing is recorded as a baseline and never later
-# mistaken for new when its owner bumps it.
+# and records every listing as a silent baseline, so only listings that
+# appear afterwards are ever sent.
 FIRST_RUN_MAX_PAGES = int(os.environ.get("LISTAM_FIRST_RUN_MAX_PAGES") or "50")
-# On the first run, every listing is baselined, but only the N most recently
-# active ones have their posted date checked (one item-page fetch each).
-# Listings posted today cluster near the top under renewal-date sort.
-FIRST_RUN_DATE_CHECK_LIMIT = int(os.environ.get("LISTAM_FIRST_RUN_DATE_CHECK_LIMIT") or "300")
 FAILURE_ALERT_THRESHOLD = 3
-ITEM_FETCH_DELAY_SEC = 0.4

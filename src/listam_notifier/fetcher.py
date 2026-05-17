@@ -30,7 +30,3 @@ def fetch_results_page(filter_url: str, page: int) -> str:
         sep = "&" if "?" in filter_url else "?"
         url = f"{filter_url}{sep}pg={page}"
     return _get(url)
-
-
-def fetch_item_page(item_id: str) -> str:
-    return _get(f"https://www.list.am/item/{item_id}")

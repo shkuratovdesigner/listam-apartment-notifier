@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from listam_notifier import config
-from listam_notifier.fetcher import fetch_results_page, fetch_item_page
-from listam_notifier.item_date import parse_posted_date
+from listam_notifier.fetcher import fetch_results_page
 from listam_notifier.parser import Listing, parse_listings
 from listam_notifier.state import State, load_state, save_state
 from listam_notifier.telegram import format_listing_message, send_message, send_alert
 
-ARMENIA_TZ = timezone(timedelta(hours=4))
 SEND_DELAY_SEC = 1.0
 
 
@@ -44,33 +41,6 @@ def collect_listings(max_pages: int) -> list[Listing]:
         seen.update(l.item_id for l in fresh)
         all_listings.extend(fresh)
     return all_listings
-
-
-def select_first_run_today(listings: list[Listing]) -> tuple[list[Listing], set[str]]:
-    """One-time: open each item page, keep those posted today (Armenia time).
-
-    Returns (todays, undated_ids). undated_ids are listings whose posted date
-    could not be fetched; callers leave them unseen so a later run retries.
-    """
-    today = datetime.now(ARMENIA_TZ).date()
-    todays: list[Listing] = []
-    undated_ids: set[str] = set()
-    total = len(listings)
-    for idx, listing in enumerate(listings, 1):
-        try:
-            posted = parse_posted_date(fetch_item_page(listing.item_id))
-        except Exception as exc:  # noqa: BLE001
-            print(f"  item {listing.item_id}: date fetch failed: {exc}", file=sys.stderr)
-            posted = None
-        if posted == today:
-            todays.append(listing)
-        elif posted is None:
-            undated_ids.add(listing.item_id)
-        if idx % 25 == 0:
-            print(f"  ...{idx}/{total} dates checked, {len(todays)} from today",
-                  flush=True)
-        time.sleep(config.ITEM_FETCH_DELAY_SEC)
-    return todays, undated_ids
 
 
 def _send_all(to_send: list[Listing]) -> set[str]:
@@ -107,12 +77,11 @@ def run() -> int:
                 print(f"alert send failed: {alert_exc}", file=sys.stderr)
         return 1
 
-    undated_ids: set[str] = set()
     if first_run:
-        to_check = listings[:config.FIRST_RUN_DATE_CHECK_LIMIT]
-        print(f"First run: {len(listings)} listings baselined; checking posted "
-              f"dates for the {len(to_check)} most recent...")
-        to_send, undated_ids = select_first_run_today(to_check)
+        # The first run records every current listing as a silent baseline,
+        # so only listings that appear afterwards are ever sent.
+        print(f"First run: baselining {len(listings)} listings silently.")
+        to_send: list[Listing] = []
     else:
         to_send = select_ongoing_new(listings, state)
 
@@ -122,10 +91,8 @@ def run() -> int:
         print(f"{len(failed_ids)} message(s) failed to send; "
               f"will retry next run.", file=sys.stderr)
 
-    # Mark every listing seen EXCEPT ones we failed to send and ones whose
-    # first-run date lookup failed — those are retried on the next run.
-    skip = failed_ids | undated_ids
-    state.seen_ids.update(l.item_id for l in listings if l.item_id not in skip)
+    # Mark every listing seen except ones we failed to send (retried next run).
+    state.seen_ids.update(l.item_id for l in listings if l.item_id not in failed_ids)
     state.initialized = True
     state.consecutive_failures = 0
     save_state(state_path, state)
