@@ -20,15 +20,15 @@ def select_ongoing_new(listings: list[Listing], state: State) -> list[Listing]:
     return [l for l in listings if l.item_id not in state.seen_ids]
 
 
-def collect_listings() -> list[Listing]:
-    """Fetch results pages until one yields no new IDs or MAX_PAGES is hit.
+def collect_listings(max_pages: int) -> list[Listing]:
+    """Fetch results pages until one yields no new IDs or max_pages is hit.
 
     A failure on the first page raises; a failure on a later page stops
     pagination and returns whatever was collected so far.
     """
     all_listings: list[Listing] = []
     seen: set[str] = set()
-    for page in range(1, config.MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         try:
             html = fetch_results_page(config.FILTER_URL, page)
         except Exception as exc:  # noqa: BLE001
@@ -87,8 +87,10 @@ def run() -> int:
     state_path = Path(config.STATE_PATH)
     state = load_state(state_path)
 
+    first_run = not state.initialized
+    max_pages = config.FIRST_RUN_MAX_PAGES if first_run else config.MAX_PAGES
     try:
-        listings = collect_listings()
+        listings = collect_listings(max_pages)
     except Exception as exc:  # noqa: BLE001
         state.consecutive_failures += 1
         save_state(state_path, state)
@@ -102,11 +104,11 @@ def run() -> int:
         return 1
 
     undated_ids: set[str] = set()
-    if state.initialized:
-        to_send = select_ongoing_new(listings, state)
-    else:
+    if first_run:
         print(f"First run: checking posted dates for {len(listings)} listings...")
         to_send, undated_ids = select_first_run_today(listings)
+    else:
+        to_send = select_ongoing_new(listings, state)
 
     print(f"Found {len(listings)} listings, sending {len(to_send)}.")
     failed_ids = _send_all(to_send)
