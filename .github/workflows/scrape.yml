@@ -29,6 +29,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LISTAM_FILTER_URL: ${{ secrets.LISTAM_FILTER_URL }}
+          PYTHONPATH: src
         run: python -m listam_notifier.main
 
       - name: Commit updated state
