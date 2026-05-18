@@ -1,8 +1,12 @@
 name: ListAM scrape
 
+# GitHub throttles frequent `schedule` crons, so instead of one short run per
+# cron tick, each run self-loops: it scrapes every 5 minutes for ~5h40m. The
+# hourly trigger just keeps a fresh run queued behind the one in progress, so
+# (with the concurrency group serialising them) polling stays continuous.
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every ~10 min (GitHub may delay this)
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -15,6 +19,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -24,22 +29,23 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Scrape loop (every 5 min for ~5h40m)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LISTAM_FILTER_URL: ${{ secrets.LISTAM_FILTER_URL }}
           PYTHONPATH: src
-        run: python -m listam_notifier.main
-
-      - name: Commit updated state
-        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update scraper state [skip ci]"
-            git pull --rebase --autostash
-            git push
-          fi
+          END=$((SECONDS + 20400))   # ~5h40m, then exit so the queued run takes over
+          while [ "$SECONDS" -lt "$END" ]; do
+            python -m listam_notifier.main || true
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: update scraper state [skip ci]"
+              git pull --rebase --autostash || true
+              git push || true
+            fi
+            sleep 300
+          done
